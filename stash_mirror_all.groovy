@@ -21,67 +21,165 @@ import org.apache.http.client.config.RequestConfig
 import org.apache.http.client.methods.HttpGet
 import org.apache.http.impl.client.BasicCredentialsProvider
 import org.apache.http.impl.client.CloseableHttpClient
+import org.apache.http.client.HttpClient
 import org.apache.http.impl.client.cache.CacheConfig
 import org.apache.http.impl.client.cache.CachingHttpClients
 
 
-def main() {
+class StashMirrorAll {
 
-    def log = { message, level = 0 ->
+    File backupPath
+    String apiBaseUrl
+    String sshBaseUrl
+    String sshCloneUrl
+    String cloneUrlBasePath
+
+    Map<String, String> headers = [:]
+
+    HttpClient httpClient
+
+    StashMirrorAll(Properties p) {
+
+        String stashUrl = p["stashUrl"]
+        String username = p["username"]
+        String password = p["password"]
+
+        this.with {
+            backupPath = new File(p["backupPath"])
+            apiBaseUrl = stashUrl + "/rest/api/1.0"
+            sshBaseUrl = stashUrl + "/rest/ssh/1.0"
+            cloneUrlBasePath = stashUrl.replace("://", "://$username@") + "/scm"
+
+            headers += ['Authorization': "Basic " + "$username:$password".bytes.encodeBase64().toString()]
+            sshCloneUrl = p["sshCloneUrl"]
+            httpClient = HttpComponentUtils.createCloseableCachingHttpCache()
+        }
+    }
+
+
+    void mirrorAllRepositories() {
+
+        log "Backing up to $backupPath.absolutePath"
+
+        mirrorRepositoriesFromProjects()
+        mirrorRepositoriesFromUsers()
+//        downloadUserKeys()
+    }
+
+
+    void mirrorRepositoriesFromProjects() {
+
+        log "\n\n-- MIRRORING PROJECT REPOSITORIES --"
+
+        def projects = HttpComponentUtils.getJson(httpClient, "$apiBaseUrl/projects/", headers)
+        log "Found ${projects.values.size()} projects"
+
+        projects.values.each { project ->
+
+            log "Looking for repositories for project $project.name ($project.key)"
+            def repos = HttpComponentUtils.getJson(httpClient, "$apiBaseUrl/$project.link.url/repos", headers)
+            log "Found ${repos.values.size} repositories"
+
+            repos.values.each { repo ->
+                mirrorRepository(repo)
+            }
+            log "\n"
+        }
+    }
+
+
+    void mirrorRepositoriesFromUsers() {
+
+        log "\n\n-- MIRRORING USER REPOSITORIES --"
+
+        def users = HttpComponentUtils.getJson(httpClient, "$apiBaseUrl/users/", headers)
+        log "Found ${users.values.size()} users"
+
+        users.values.each { user ->
+
+            log "Looking for repositories for user $user.name ($user.slug)"
+            def repos = HttpComponentUtils.getJson(httpClient, "$apiBaseUrl/users/$user.slug/repos")
+            log "Found ${repos.values.size} repositories"
+
+            repos.values.each { repo ->
+                mirrorRepository(repo)
+            }
+            log "\n"
+        }
+    }
+
+
+    void mirrorRepository(Map repository) {
+
+        log "Backing up repository $repository.name", 1
+
+        def repoPath = repository.cloneUrl.replace(cloneUrlBasePath, "")
+        def cloneUrl = sshCloneUrl + repoPath
+
+        def checkoutPathFile = new File(backupPath, repoPath)
+        if (checkoutPathFile.exists()) {
+            log "$repository.name already mirrored. Updating from remote.", 2
+            def cmd = "cd $checkoutPathFile.absolutePath; git remote update;"
+            log cmd, 2
+            exec(cmd)
+        } else {
+            log "$repository.name is new. Making a clone --mirror", 2
+            def cmd = "git clone --mirror $cloneUrl $checkoutPathFile.absolutePath"
+            log cmd, 2
+            exec(cmd)
+        }
+    }
+
+
+    void downloadUserKeys() {
+
+        def users = HttpComponentUtils.getJson(httpClient, "$apiBaseUrl/users/", headers)
+        users.values.each { user ->
+
+            println user
+            println HttpComponentUtils.getJson(httpClient, "$sshBaseUrl/keys?user=$user.name", headers)
+        }
+    }
+
+
+    static void log(message, level = 0) {
+
         level.times { print "  " }
         println message
     }
+
+
+    protected static void exec(String cmd) {
+
+        runCmd(cmd, System.out)
+    }
+
+
+    protected static void runCmd(String cmd, OutputStream out) {
+
+        String[] sh = [
+                "/bin/sh",
+                "-c",
+                cmd
+        ]
+
+        def process = Runtime.runtime.exec(sh)
+        IOUtils.copy(new InputStreamReader(process.inputStream), out)
+        process.waitFor()
+    }
+
+}
+
+
+def main() {
 
     def configFile = new File(".stash_backup")
     Properties p = new Properties()
     p.load(new FileInputStream(configFile))
 
-    def basePath = new File(p["backupPath"])
-    log "Backing up to $basePath.absolutePath"
-
-    def stashUrl = p["stashUrl"]
-    def baseUrl = stashUrl + "/rest/api/1.0"
-
-    def username = p["username"]
-    def password = p["password"]
-    def headers = ['Authorization': "Basic " + "$username:$password".bytes.encodeBase64().toString()]
-    def sshCloneUrl = p["sshCloneUrl"]
-
-    def cloneUrlBasePath = stashUrl.replace("://", "://$username@") + "/scm"
-
-    CloseableHttpClient httpClient = HttpComponentUtils.createCloseableCachingHttpCache()
-
-    def projects = HttpComponentUtils.getJson(httpClient, "$baseUrl/projects/", headers)
-    log "Found ${projects.values.size()} projects"
-
-    projects.values.each { project ->
-
-        log "Looking for repositories for project $project.name ($project.key)"
-        def repos = HttpComponentUtils.getJson(httpClient, "$baseUrl/$project.link.url/repos", headers)
-        log "Found ${repos.values.size} repositories"
-
-        repos.values.each { repo ->
-            log "Backing up repository $repo.name", 1
-
-            def repoPath = repo.cloneUrl.replace(cloneUrlBasePath, "")
-            def cloneUrl = sshCloneUrl + repoPath
-
-            def checkoutPathFile = new File(basePath, repoPath)
-            if (checkoutPathFile.exists()) {
-                log "$repo.name already mirrored. Updating from remote.", 2
-                def cmd = "cd $checkoutPathFile.absolutePath; git remote update;"
-                log cmd, 2
-                exec(cmd)
-            } else {
-                log "$repo.name is new. Making a clone --mirror", 2
-                def cmd = "git clone --mirror $cloneUrl $checkoutPathFile.absolutePath"
-                log cmd, 2
-                exec(cmd)
-            }
-        }
-        println "\n"
-    }
+    new StashMirrorAll(p).mirrorAllRepositories()
 }
+
 
 main()
 
@@ -142,20 +240,20 @@ class HttpComponentUtils {
     }
 
 
-    static Object getJson(CloseableHttpClient httpClient, String url, Map headers = [:]) throws ClientProtocolException, IOException {
+    static Object getJson(HttpClient httpClient, String url, Map headers = [:]) throws ClientProtocolException, IOException {
 
         new JsonSlurper().parseText(getString(httpClient, url, headers))
     }
 
 
-    static String getString(CloseableHttpClient httpClient, String url, Map headers = [:]) throws ClientProtocolException, IOException {
+    static String getString(HttpClient httpClient, String url, Map headers = [:]) throws ClientProtocolException, IOException {
 
         ByteArrayOutputStream bytes = getBytes(httpClient, url, headers)
         bytes.toString()
     }
 
 
-    static ByteArrayOutputStream getBytes(CloseableHttpClient httpClient, String url, Map headers = [:]) throws ClientProtocolException, IOException {
+    static ByteArrayOutputStream getBytes(HttpClient httpClient, String url, Map headers = [:]) throws ClientProtocolException, IOException {
 
         HttpGet getRequest = new HttpGet(url)
         headers.each { key, value ->
@@ -173,24 +271,4 @@ class HttpComponentUtils {
             content
         } as ResponseHandler<ByteArrayOutputStream>, context)
     }
-}
-
-
-def exec(String cmd) {
-
-    runCmd(cmd, System.out)
-}
-
-
-protected void runCmd(String cmd, OutputStream out) {
-
-    String[] sh = [
-            "/bin/sh",
-            "-c",
-            cmd
-    ]
-
-    def process = Runtime.runtime.exec(sh)
-    IOUtils.copy(new InputStreamReader(process.inputStream), out)
-    process.waitFor()
 }
